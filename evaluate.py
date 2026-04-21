@@ -12,25 +12,23 @@ import torch
 from sklearn.metrics import ConfusionMatrixDisplay, confusion_matrix
 from torch import nn
 
-from src.data import PathRemapConfig, create_dataloaders
+from src.data import create_waste_dataloaders
 from src.engine import measure_inference_time, run_eval_epoch
 from src.models import build_model
 from src.utils import get_device, save_json
 
+MODEL_CHOICES = ["resnet18", "vit_b_16", "custom_cnn", "custom_vit"]
+
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate trained mushroom baseline model")
-    parser.add_argument("--model", choices=["resnet18", "vit_b_16"], required=True)
+    parser = argparse.ArgumentParser(description="Evaluate trained waste baseline model")
+    parser.add_argument("--model", choices=MODEL_CHOICES, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--train-csv", type=Path, default=Path("mushroom1/train.csv"))
-    parser.add_argument("--val-csv", type=Path, default=Path("mushroom1/val.csv"))
-    parser.add_argument("--test-csv", type=Path, default=Path("mushroom1/test.csv"))
-    parser.add_argument("--data-root", type=Path, default=None)
-    parser.add_argument("--path-prefix-from", type=str, default=None)
-    parser.add_argument("--path-prefix-to", type=str, default=None)
-    parser.add_argument("--strict-paths", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--dataset-root", type=Path, default=Path("waste/DATASET"))
+    parser.add_argument("--val-split", type=float, default=0.1)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-eval-batches", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--output-dir", type=Path, default=Path("artifacts"))
@@ -45,20 +43,13 @@ def main() -> None:
     class_to_idx: dict[str, int] = checkpoint["class_to_idx"]
     idx_to_class = {v: k for k, v in class_to_idx.items()}
 
-    remap = PathRemapConfig(
-        data_root=args.data_root,
-        path_prefix_from=args.path_prefix_from,
-        path_prefix_to=args.path_prefix_to,
-    )
-    _, _, test_loader, _ = create_dataloaders(
+    _, _, test_loader, _, dataset_info = create_waste_dataloaders(
         model_name=args.model,
-        train_csv=args.train_csv,
-        val_csv=args.val_csv,
-        test_csv=args.test_csv,
+        dataset_root=args.dataset_root,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        remap=remap,
-        strict_paths=args.strict_paths,
+        val_split=args.val_split,
+        seed=args.seed,
         pin_memory=device.type == "cuda",
     )
 
@@ -100,6 +91,7 @@ def main() -> None:
             "device": str(device),
             "checkpoint": str(args.checkpoint),
             "test_metrics": metrics,
+            **dataset_info,
         },
         out_dir / "metrics.json",
     )

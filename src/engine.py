@@ -11,6 +11,13 @@ from torch import nn
 from tqdm import tqdm
 
 
+def _synchronize_device(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    elif device.type == "mps":
+        torch.mps.synchronize()
+
+
 def _topk_accuracy(logits: torch.Tensor, targets: torch.Tensor, k: int = 5) -> float:
     k = min(k, logits.size(1))
     topk = torch.topk(logits, k=k, dim=1).indices
@@ -74,12 +81,13 @@ def run_eval_epoch(
     criterion: nn.Module,
     device: torch.device,
     max_batches: int | None = None,
-) -> tuple[dict[str, float], list[int], list[int], np.ndarray]:
+) -> tuple[dict[str, float | None], list[int], list[int], np.ndarray]:
     model.eval()
     running_loss = 0.0
     all_targets: list[int] = []
     all_preds: list[int] = []
     top5_sum = 0.0
+    num_classes: int | None = None
     probs_list: list[np.ndarray] = []
 
     for batch_idx, (images, targets, *_rest) in enumerate(tqdm(dataloader, desc="eval", leave=False)):
@@ -89,6 +97,8 @@ def run_eval_epoch(
         targets = targets.to(device, non_blocking=True)
 
         logits = model(images)
+        if num_classes is None:
+            num_classes = int(logits.size(1))
         loss = criterion(logits, targets)
         probs = torch.softmax(logits, dim=1)
         preds = torch.argmax(logits, dim=1)
@@ -96,7 +106,8 @@ def run_eval_epoch(
         all_targets.extend(targets.cpu().tolist())
         all_preds.extend(preds.cpu().tolist())
         probs_list.append(probs.cpu().numpy())
-        top5_sum += _topk_accuracy(logits, targets, k=5) * images.size(0)
+        if num_classes > 5:
+            top5_sum += _topk_accuracy(logits, targets, k=5) * images.size(0)
         running_loss += loss.item() * images.size(0)
 
     n = len(all_targets)
@@ -105,7 +116,7 @@ def run_eval_epoch(
         "accuracy": accuracy_score(all_targets, all_preds) if n else 0.0,
         "macro_f1": f1_score(all_targets, all_preds, average="macro") if n else 0.0,
         "weighted_f1": f1_score(all_targets, all_preds, average="weighted") if n else 0.0,
-        "top5_accuracy": top5_sum / max(n, 1),
+        "top5_accuracy": (top5_sum / max(n, 1)) if num_classes and num_classes > 5 else None,
     }
     probabilities = np.concatenate(probs_list, axis=0) if probs_list else np.zeros((0, 0))
     return metrics, all_targets, all_preds, probabilities
@@ -120,12 +131,10 @@ def measure_inference_time(model: nn.Module, dataloader: Iterable, device: torch
         if batch_idx >= batches:
             break
         images = images.to(device, non_blocking=True)
-        if device.type == "cuda":
-            torch.cuda.synchronize()
+        _synchronize_device(device)
         start = time.perf_counter()
         _ = model(images)
-        if device.type == "cuda":
-            torch.cuda.synchronize()
+        _synchronize_device(device)
         total_time += time.perf_counter() - start
         total_images += images.size(0)
     if total_images == 0:

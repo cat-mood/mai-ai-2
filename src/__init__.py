@@ -1,1 +1,1 @@
-"""Training utilities for mushroom classification baselines."""
+"""Training utilities for image classification baselines."""

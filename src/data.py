@@ -3,10 +3,12 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable
 
+import torch
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
+from torchvision.datasets import ImageFolder
 from torchvision import transforms
 
 
@@ -81,7 +83,7 @@ class MushroomCsvDataset(Dataset):
         if strict_paths and missing_count > 0:
             raise FileNotFoundError(
                 f"{csv_path} has {missing_count} missing files after remapping. "
-                "Check --data-root and/or --path-prefix-from/--path-prefix-to."
+                "Check your path remapping settings."
             )
 
     def __len__(self) -> int:
@@ -95,17 +97,32 @@ class MushroomCsvDataset(Dataset):
         return image, target, str(image_path), raw_path
 
 
-def build_transforms(model_name: str) -> tuple[Callable, Callable]:
+def build_transforms(model_name: str, aug_profile: str = "baseline") -> tuple[Callable, Callable]:
     input_size = 224
-    train_transform = transforms.Compose(
-        [
-            transforms.RandomResizedCrop(input_size),
-            transforms.RandomHorizontalFlip(),
-            transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
-            transforms.ToTensor(),
-            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-        ]
-    )
+    if aug_profile == "strong":
+        train_transform = transforms.Compose(
+            [
+                transforms.RandomResizedCrop(input_size, scale=(0.6, 1.0), ratio=(0.8, 1.25)),
+                transforms.RandomHorizontalFlip(),
+                transforms.RandomRotation(12),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.02),
+                transforms.ToTensor(),
+                transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+                transforms.RandomErasing(p=0.2, scale=(0.02, 0.15), ratio=(0.3, 3.3)),
+            ]
+        )
+    elif aug_profile == "baseline":
+        train_transform = transforms.Compose(
+            [
+                transforms.RandomResizedCrop(input_size),
+                transforms.RandomHorizontalFlip(),
+                transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
+                transforms.ToTensor(),
+                transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+            ]
+        )
+    else:
+        raise ValueError(f"Unsupported aug_profile: {aug_profile}")
     eval_transform = transforms.Compose(
         [
             transforms.Resize(256),
@@ -116,12 +133,12 @@ def build_transforms(model_name: str) -> tuple[Callable, Callable]:
     )
 
     # Keep API explicit for possible model-specific transforms later.
-    if model_name in {"resnet18", "vit_b_16"}:
+    if model_name in {"resnet18", "vit_b_16", "custom_cnn", "custom_vit"}:
         return train_transform, eval_transform
     raise ValueError(f"Unsupported model_name: {model_name}")
 
 
-def create_dataloaders(
+def create_csv_dataloaders(
     *,
     model_name: str,
     train_csv: Path,
@@ -132,8 +149,9 @@ def create_dataloaders(
     remap: PathRemapConfig,
     strict_paths: bool = True,
     pin_memory: bool = False,
+    aug_profile: str = "baseline",
 ) -> tuple[DataLoader, DataLoader, DataLoader, dict[str, int]]:
-    train_transform, eval_transform = build_transforms(model_name)
+    train_transform, eval_transform = build_transforms(model_name, aug_profile=aug_profile)
     train_dataset = MushroomCsvDataset(train_csv, transform=train_transform, remap=remap, strict_paths=strict_paths)
     val_dataset = MushroomCsvDataset(
         val_csv,
@@ -174,10 +192,109 @@ def create_dataloaders(
     return train_loader, val_loader, test_loader, train_dataset.class_to_idx
 
 
+def resolve_waste_root(dataset_root: Path) -> Path:
+    candidates = [
+        dataset_root,
+        dataset_root / "DATASET",
+        dataset_root / "DATASET" / "DATASET",
+    ]
+    for candidate in candidates:
+        train_dir = candidate / "TRAIN"
+        test_dir = candidate / "TEST"
+        if train_dir.exists() and test_dir.exists():
+            return candidate
+    raise FileNotFoundError(
+        f"Could not find TRAIN/TEST folders under {dataset_root}. "
+        "Expected either <root>/TRAIN and <root>/TEST or nested DATASET/."
+    )
+
+
+def create_waste_dataloaders(
+    *,
+    model_name: str,
+    dataset_root: Path,
+    batch_size: int,
+    num_workers: int,
+    val_split: float = 0.1,
+    seed: int = 42,
+    pin_memory: bool = False,
+    aug_profile: str = "baseline",
+) -> tuple[DataLoader, DataLoader, DataLoader, dict[str, int], dict[str, int | str]]:
+    if not (0.0 < val_split < 1.0):
+        raise ValueError("--val-split must be between 0 and 1.")
+
+    resolved_root = resolve_waste_root(dataset_root)
+    train_transform, eval_transform = build_transforms(model_name, aug_profile=aug_profile)
+
+    train_base = ImageFolder(resolved_root / "TRAIN", transform=train_transform)
+    eval_base = ImageFolder(resolved_root / "TRAIN", transform=eval_transform)
+    test_base = ImageFolder(resolved_root / "TEST", transform=eval_transform)
+
+    if train_base.class_to_idx != test_base.class_to_idx:
+        raise ValueError("Class mapping mismatch between TRAIN and TEST folders.")
+
+    total_train = len(train_base)
+    val_size = max(1, int(total_train * val_split))
+    train_size = total_train - val_size
+    if train_size <= 0:
+        raise ValueError("Validation split is too large for current train set.")
+
+    generator = torch.Generator().manual_seed(seed)
+    shuffled_indices = torch.randperm(total_train, generator=generator).tolist()
+    val_indices = shuffled_indices[:val_size]
+    train_indices = shuffled_indices[val_size:]
+
+    train_dataset = Subset(train_base, train_indices)
+    val_dataset = Subset(eval_base, val_indices)
+    test_dataset = test_base
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+
+    info = {
+        "resolved_dataset_root": str(resolved_root),
+        "train_samples": train_size,
+        "val_samples": val_size,
+        "test_samples": len(test_dataset),
+    }
+    return train_loader, val_loader, test_loader, train_base.class_to_idx, info
+
+
 def class_distribution(dataset: Dataset) -> dict[int, int]:
     dist: dict[int, int] = {}
-    samples = getattr(dataset, "samples", [])
-    for _, label_idx, _ in samples:
-        dist[label_idx] = dist.get(label_idx, 0) + 1
+    if isinstance(dataset, Subset):
+        base = dataset.dataset
+        if hasattr(base, "targets"):
+            for idx in dataset.indices:
+                label_idx = int(base.targets[idx])
+                dist[label_idx] = dist.get(label_idx, 0) + 1
+        return dist
+
+    samples = getattr(dataset, "samples", None)
+    if samples is not None:
+        for sample in samples:
+            # CSV dataset sample format: (path, label_idx, raw_path)
+            # ImageFolder sample format: (path, label_idx)
+            label_idx = int(sample[1])
+            dist[label_idx] = dist.get(label_idx, 0) + 1
     return dist
 

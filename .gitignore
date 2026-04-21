@@ -1,9 +1,11 @@
-mushroom1/
-mushroom1.zip
 .venv/
 __pycache__/
 artifacts/
-mushroom1_data/
+artifacts_waste/
+artifacts_improved/
+artifacts_custom/
+artifacts_custom_smoke/
 .cache/
 .DS_Store
-mushroom1.zip
+waste-classification-data.zip
+waste/
